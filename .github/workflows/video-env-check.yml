@@ -1,0 +1,23 @@
+name: video-env-check
+
+on:
+  push:
+    branches: [work/video-env-20260922]
+  pull_request:
+    branches: [work/video-env-20260922]
+
+jobs:
+  dry-run-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Syntax check ComfyUI bridge (no services, no paid calls)
+        run: |
+          python3 -m compileall -q integrations/comfyui_bridge/custom_node/nodes.py integrations/comfyui_bridge/custom_node/client.py
+      - name: Workflows JSON present and valid
+        run: |
+          ls integrations/comfyui_bridge/workflows/*.json
+          for f in integrations/comfyui_bridge/workflows/*.json; do python3 -m json.tool "$f" > /dev/null || exit 1; done
