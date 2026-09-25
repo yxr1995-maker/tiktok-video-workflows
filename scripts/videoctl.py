@@ -75,22 +75,74 @@ def check_decodable(path: Path | str) -> Tuple[bool, str]:
 
 
 def check_brightness(path: Path | str, sample_count: int = 5) -> Dict[str, Any]:
-    """Sample frames for YAVG. Extreme values (<=18.0 or >=235.0) are WARNING only."""
-    cmd = [
-        pick_ffmpeg(), "-v", "error", "-i", str(path), "-vframes", str(sample_count),
-        "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
-        "-f", "null", "-",
-    ]
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    vals = [float(l.split("=", 1)[1]) for l in p.stdout.splitlines() if "lavfi.signalstats.YAVG=" in l]
-    avg = sum(vals) / len(vals) if vals else None
-    warn = None
-    if avg is not None:
-        if avg <= 18.0:
-            warn = f"Video brightness average luminance is very low ({avg:.1f} <= 18.0); scene may appear too dark."
-        elif avg >= 235.0:
-            warn = f"Video brightness average luminance is very high ({avg:.1f} >= 235.0); scene may appear overexposed."
-    return {"avg_luma": avg, "sample_count": len(vals), "warning": warn}
+    """Sample frames at distributed midpoints across the entire video duration.
+    Returns individual sample timestamps and YAVG values (no false fade-in bias).
+    Any sample < 100.0 or > 235.0 triggers a warning only.
+    Fails if any requested sample cannot be extracted (never false-pass).
+    """
+    if sample_count < 1:
+        return {"error": f"sample_count must be positive (got {sample_count})", "samples": [], "avg_luma": None, "warnings": []}
+    try:
+        probe = probe_media(path)
+    except Exception as e:
+        return {"error": f"Failed to probe media for brightness check: {e}", "samples": [], "avg_luma": None, "warnings": []}
+
+    format_info = probe.get("format", {})
+    try:
+        dur = float(format_info.get("duration", 0.0))
+    except (ValueError, TypeError):
+        dur = 0.0
+
+    if dur <= 0.05:
+        v_stream = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+        if v_stream and v_stream.get("duration"):
+            try:
+                dur = float(v_stream["duration"])
+            except (ValueError, TypeError):
+                dur = 0.0
+
+    if dur <= 0.05:
+        return {"error": f"Video duration is zero or invalid ({dur}s); cannot sample brightness midpoints", "samples": [], "avg_luma": None, "warnings": []}
+
+    ffmpeg_bin = pick_ffmpeg()
+    samples: List[Dict[str, float]] = []
+    warnings: List[str] = []
+    timestamps = [(i + 0.5) * (dur / sample_count) for i in range(sample_count)]
+
+    for t in timestamps:
+        cmd = [
+            ffmpeg_bin, "-v", "error", "-ss", f"{t:.3f}", "-i", str(path),
+            "-vframes", "1",
+            "-vf", "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=-",
+            "-f", "null", "-",
+        ]
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except Exception as e:
+            return {"error": f"Brightness sample at {t:.2f}s failed: {e}", "samples": samples, "avg_luma": None, "warnings": warnings}
+        if p.returncode != 0:
+            return {"error": f"Brightness sample at {t:.2f}s failed (ffmpeg exit {p.returncode}): {p.stderr.strip()}", "samples": samples, "avg_luma": None, "warnings": warnings}
+        try:
+            vals = [float(l.split("=", 1)[1]) for l in p.stdout.splitlines() if "lavfi.signalstats.YAVG=" in l]
+        except (ValueError, IndexError) as e:
+            return {"error": f"Invalid brightness sample at {t:.2f}s: {e}", "samples": samples, "avg_luma": None, "warnings": warnings}
+        if vals:
+            yavg_val = round(vals[0], 2)
+            t_val = round(t, 2)
+            samples.append({"time": t_val, "yavg": yavg_val})
+            if yavg_val < 100.0:
+                warnings.append(f"Sample at {t_val:.2f}s luminance is low ({yavg_val:.1f} < 100.0); scene may appear underexposed")
+            elif yavg_val > 235.0:
+                warnings.append(f"Sample at {t_val:.2f}s luminance is high ({yavg_val:.1f} > 235.0); scene may appear overexposed")
+        else:
+            return {"error": f"No brightness value extracted at {t:.2f}s", "samples": samples, "avg_luma": None, "warnings": warnings}
+
+    if not samples:
+        return {"error": "No brightness samples could be extracted; ffmpeg decode failed or produced no frames", "samples": [], "avg_luma": None, "warnings": []}
+
+    avg_luma = round(sum(s["yavg"] for s in samples) / len(samples), 2)
+    warning_str = "; ".join(warnings) if warnings else None
+    return {"avg_luma": avg_luma, "sample_count": len(samples), "samples": samples, "warnings": warnings, "warning": warning_str}
 
 
 # --- Subcommands ---
@@ -417,8 +469,10 @@ def run_preflight(
                         if any(s.get("codec_type") == "audio" for s in probe.get("streams", [])):
                             has_audio = True
                         br = check_brightness(cp, sample_count=3)
-                        if br.get("warning"):
-                            warnings.append(f"Scene {i} clip ({cp.name}): {br['warning']}")
+                        if br.get("error"):
+                            errors.append(f"Scene {i} clip ({cp.name}) brightness check error: {br['error']}")
+                        for w in br.get("warnings", []):
+                            warnings.append(f"Scene {i} clip ({cp.name}): {w}")
 
             effective_sc_dur = float(sc.get("duration", clip_dur or 0.0))
             total_duration += effective_sc_dur
@@ -484,8 +538,12 @@ def run_preflight(
                 if not any(s.get("codec_type") == "audio" for s in probe.get("streams", [])):
                     errors.append(f"Video has no audio stream: {vp}")
                 br = check_brightness(vp, sample_count=5)
-                if br.get("warning"):
-                    warnings.append(f"Video {vp.name}: {br['warning']}")
+                if br.get("error"):
+                    errors.append(f"Video {vp.name} brightness check error: {br['error']}")
+                elif not br.get("samples"):
+                    errors.append(f"Video {vp.name} brightness check error: no luminance samples extracted")
+                for w in br.get("warnings", []):
+                    warnings.append(f"Video {vp.name}: {w}")
 
     return {"status": "fail" if errors else ("warning" if warnings else "pass"), "errors": errors, "warnings": warnings}
 
@@ -536,8 +594,12 @@ def run_qc(
         errors.append("Missing audio stream (video has no audio)")
 
     br = check_brightness(vp, sample_count=5)
-    if br.get("warning"):
-        warnings.append(br["warning"])
+    if br.get("error"):
+        errors.append(f"Brightness QC error: {br['error']}")
+    elif not br.get("samples"):
+        errors.append("Brightness QC error: no luminance samples extracted")
+    for w in br.get("warnings", []):
+        warnings.append(w)
 
     return {
         "status": "fail" if errors else ("warning" if warnings else "pass"),
@@ -548,6 +610,10 @@ def run_qc(
         "fps": round(fps_val, 2) if fps_val else None,
         "has_audio": a_st is not None,
         "audio_codec": a_st.get("codec_name") if a_st else None,
+        "brightness": {
+            "avg_luma": br.get("avg_luma"),
+            "samples": br.get("samples", []),
+        },
         "brightness_avg_luma": br.get("avg_luma"),
         "errors": errors, "warnings": warnings,
     }

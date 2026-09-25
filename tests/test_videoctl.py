@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -317,6 +318,34 @@ class TestVideoctl(unittest.TestCase):
             videoctl.run_manifest(files=[])
         with self.assertRaises(FileNotFoundError):
             videoctl.run_manifest(files=["/tmp/nonexistent_missing_file_8877.mp4"])
+
+    def test_09_brightness_samples_full_duration_and_fails_on_ffmpeg_error(self):
+        path = self.tmppath / "bright_then_dark.mp4"
+        subprocess.run([
+            self.ffmpeg, "-y", "-v", "error",
+            "-f", "lavfi", "-i", "color=c=white:s=320x568:r=30:d=2",
+            "-f", "lavfi", "-i", "color=c=black:s=320x568:r=30:d=8",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=10",
+            "-filter_complex", "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map", "[v]", "-map", "2:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+            str(path),
+        ], check=True)
+
+        result = videoctl.check_brightness(path, sample_count=5)
+        self.assertNotIn("error", result)
+        self.assertEqual([s["time"] for s in result["samples"]], [1.0, 3.0, 5.0, 7.0, 9.0])
+        self.assertEqual(result["samples"][0]["yavg"], 235.0)
+        self.assertFalse(any("high" in w for w in result["warnings"]))
+        self.assertTrue(all(s["yavg"] < 100.0 for s in result["samples"][1:]))
+        self.assertTrue(any("3.00s" in w for w in result["warnings"]))
+
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="decode error")
+        with patch.object(videoctl, "probe_media", return_value={"format": {"duration": "10"}}), \
+             patch.object(videoctl, "subprocess") as mocked_subprocess:
+            mocked_subprocess.run.return_value = failed
+            errored = videoctl.check_brightness(path, sample_count=5)
+        self.assertIn("error", errored)
+        self.assertEqual(errored["samples"], [])
 
 
 if __name__ == "__main__":

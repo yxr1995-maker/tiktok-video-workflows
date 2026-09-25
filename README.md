@@ -31,6 +31,8 @@ python3 videoctl.py manifest --files ./output/drama_out.mp4 --output ./output/ma
 python3 videoctl.py generate --workflow examples/comfyui_workflow_example.json --output-dir ./output/generated
 ```
 
+亮度 QC 按视频全长等间隔取 5 个中点样本，逐点输出时间与 YAVG；低于 100 或高于 235 只告警，抽样失败则 QC 失败。
+
 ## 2. 素材与产物布局
 
 | 目录/位置 | 内容说明 |
