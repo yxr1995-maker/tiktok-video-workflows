@@ -1,0 +1,26 @@
+{
+  "1": {
+    "inputs": {
+      "model": "gemini-3.1-flash-image-landscape",
+      "rerun_nonce": 0,
+      "prompt": "A modern minimalist living room with warm lighting, photorealistic, 4k"
+    },
+    "class_type": "Flow2API_ImageNode",
+    "_meta": {
+      "title": "Flow2API Image Generation"
+    }
+  },
+  "2": {
+    "inputs": {
+      "filename_prefix": "flow2api_img_out",
+      "images": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  }
+}

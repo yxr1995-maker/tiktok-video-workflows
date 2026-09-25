@@ -1,0 +1,31 @@
+{
+  "title": "Biscuit 日记 Ep1 烫脚事件 (示例模板)",
+  "source": "LibTV input (external)",
+  "review_status": "pending",
+  "claims": [],
+  "claims_verified": false,
+  "claims_source": null,
+  "claims_verified_at": null,
+  "price": "",
+  "price_verified": false,
+  "price_source": null,
+  "price_verified_at": null,
+  "font_file": "/System/Library/Fonts/STHeiti Medium.ttc",
+  "bgm_loop": true,
+  "scenes": [
+    {
+      "id": 1,
+      "clip": "clips/scene1.mp4",
+      "audio": "assets/scene1_voice.m4a",
+      "subtitle": "剧情开场台词",
+      "duration": 3
+    },
+    {
+      "id": 2,
+      "clip": "clips/scene2.mp4",
+      "audio": "assets/scene2_voice.m4a",
+      "subtitle": "剧情承接台词",
+      "duration": 3
+    }
+  ]
+}
