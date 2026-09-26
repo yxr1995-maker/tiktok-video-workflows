@@ -3,9 +3,12 @@
 TikTok 带货与短剧视频工作流沉淀（可复用）：统筹 CLI `videoctl.py` + 素材池隔离 + 本地 ffmpeg 渲染 + 质量/哈希门禁。
 
 - 详细工作流文档：[workflows/tiktok-video.md](workflows/tiktok-video.md)
+- 任意视频先做 Seedance 创作策划：[workflows/seedance-planning.md](workflows/seedance-planning.md)
 - CI 语法与干跑检查：[.github/workflows/video-env-check.yml](.github/workflows/video-env-check.yml)
 
 ## 1. 统一入口 (`videoctl.py`)
+
+制作前先按 [Seedance 创作策划](workflows/seedance-planning.md)选读真实模板并整理分镜；`videoctl` 负责既有生成/合成流程，不会自动读教程或替你选择生成模型。
 
 仓库根目录提供可执行入口 `videoctl.py`（核心位于 `scripts/videoctl.py`）：
 

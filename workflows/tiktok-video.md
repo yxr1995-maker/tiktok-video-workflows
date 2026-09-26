@@ -1,5 +1,7 @@
 # TikTok 带货视频生成工作流（可复用沉淀）
 
+> 开始任何视频前先走[Seedance 创作策划](seedance-planning.md)：按成片类型选模板，读模板正文并交付可审阅的创意方案与分镜。CLI 不会自动理解教程或选择模型。
+
 > 来源：`/Users/earan/Documents/tiktokshop/video/` 实测链路 + flow2api fork `main`（原 `work/video-env-20260922` 已并入 main，PR #1）。
 > 原则：成片入口为 ffmpeg 生成器（带货走 `build_video.py`，短剧走 `videoctl drama`）；AI 素材只进素材池；发布一律人工。
 
