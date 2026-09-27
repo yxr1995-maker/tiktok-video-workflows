@@ -33,6 +33,7 @@ import videoctl
 
 
 class MockComfyServer(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
     mode = "success"
     prompt_id = "test-mock-prompt-999"
     tiny_png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==")
@@ -160,34 +161,37 @@ class TestVideoctl(unittest.TestCase):
         port = server.server_address[1]
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
-        base_url = f"http://127.0.0.1:{port}"
+        try:
+            base_url = f"http://127.0.0.1:{port}"
 
-        wf_path = REPO_ROOT / "examples/comfyui_workflow_example.json"
-        out_dir = self.tmppath / "gen_output"
-        mf_path = self.tmppath / "gen_manifest.json"
+            wf_path = REPO_ROOT / "examples/comfyui_workflow_example.json"
+            out_dir = self.tmppath / "gen_output"
+            mf_path = self.tmppath / "gen_manifest.json"
 
-        # 1. Normal success: check workflow_sha256
-        MockComfyServer.mode = "success"
-        res = videoctl.run_generate(
-            workflow_path=wf_path, server=base_url, output_dir=out_dir,
-            manifest_path=mf_path, poll_interval=0.05, timeout=5.0,
-        )
-        self.assertEqual(res["status"], "completed")
-        self.assertTrue(res["workflow_sha256"])
-        self.assertEqual(res["workflow_sha256"], videoctl.sha256_file(wf_path))
+            # 1. Normal success: check workflow_sha256
+            MockComfyServer.mode = "success"
+            res = videoctl.run_generate(
+                workflow_path=wf_path, server=base_url, output_dir=out_dir,
+                manifest_path=mf_path, poll_interval=0.05, timeout=5.0,
+            )
+            self.assertEqual(res["status"], "completed")
+            self.assertTrue(res["workflow_sha256"])
+            self.assertEqual(res["workflow_sha256"], videoctl.sha256_file(wf_path))
 
-        # 2. History error status must raise error
-        MockComfyServer.mode = "error_status"
-        with self.assertRaises(RuntimeError) as ctx:
-            videoctl.run_generate(workflow_path=wf_path, server=base_url, output_dir=out_dir, poll_interval=0.05, timeout=5.0)
-        self.assertIn("failed", str(ctx.exception))
+            # 2. History error status must raise error
+            MockComfyServer.mode = "error_status"
+            with self.assertRaises(RuntimeError) as ctx:
+                videoctl.run_generate(workflow_path=wf_path, server=base_url, output_dir=out_dir, job_file=self.tmppath / "error-job.json", poll_interval=0.05, timeout=5.0)
+            self.assertIn("failed", str(ctx.exception))
 
-        # 3. Path traversal protection: ../../secret.png -> secret.png inside out_dir
-        MockComfyServer.mode = "path_traversal"
-        res_trav = videoctl.run_generate(workflow_path=wf_path, server=base_url, output_dir=out_dir, poll_interval=0.05, timeout=5.0)
-        self.assertEqual(res_trav["outputs"][0]["filename"], "secret.png")
+            # 3. Path traversal protection: ../../secret.png -> secret.png inside out_dir
+            MockComfyServer.mode = "path_traversal"
+            res_trav = videoctl.run_generate(workflow_path=wf_path, server=base_url, output_dir=out_dir, job_file=self.tmppath / "traversal-job.json", poll_interval=0.05, timeout=5.0)
+            self.assertEqual(res_trav["outputs"][0]["filename"], "secret.png")
 
-        server.shutdown()
+        finally:
+            server.shutdown()
+            server.server_close()
 
     def test_02_commerce_dry_run_and_render_passthrough(self):
         """Test commerce dry-run safety and that non-dry-run passes --render to to_hyperframes.py."""

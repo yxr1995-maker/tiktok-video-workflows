@@ -20,6 +20,8 @@ Ponytail rules:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -45,6 +47,65 @@ def sha256_file(path: Path | str) -> str:
         while chunk := f.read(65536):
             h.update(chunk)
     return h.hexdigest()
+
+
+def write_json_atomic(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+@contextlib.contextmanager
+def job_lock(path: Path):
+    lock_path = path.with_name(path.name + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def validate_server(server: str) -> str:
+    parsed = urllib.parse.urlsplit(server.rstrip("/"))
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("ComfyUI server must be an http(s) URL with a host and no credentials, query, or fragment")
+    return server.rstrip("/")
+
+
+def validate_job(job: Any, expected_output_dir: Path) -> Dict[str, Any]:
+    required = {"status", "workflow", "workflow_sha256", "server", "client_id", "output_dir", "outputs"}
+    if not isinstance(job, dict) or not required.issubset(job):
+        raise ValueError("Invalid job file: missing required job fields")
+    if job["status"] not in {"submitting", "submission_unknown", "submitted", "timeout", "failed", "manifest_pending", "completed"}:
+        raise ValueError("Invalid job file: unsupported status")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(job["workflow_sha256"])):
+        raise ValueError("Invalid job file: workflow_sha256 must be a SHA-256 digest")
+    if validate_server(str(job["server"])) != job["server"]:
+        raise ValueError("Invalid job file: server URL is not normalized")
+    if Path(job["output_dir"]).resolve() != expected_output_dir.resolve():
+        raise ValueError("Invalid job file: output directory does not match")
+    if not isinstance(job["outputs"], list):
+        raise ValueError("Invalid job file: outputs must be a list")
+    if job["status"] in {"submitted", "timeout", "failed", "manifest_pending", "completed"} and not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(job.get("prompt_id", ""))):
+        raise ValueError("Invalid job file: missing or malformed prompt_id")
+    if job["status"] == "completed":
+        for output in job["outputs"]:
+            if not isinstance(output, dict) or not {"path", "filename", "sha256", "size", "node_id", "category"}.issubset(output):
+                raise ValueError("Invalid job file: malformed completed output entry")
+            path = Path(output["path"]).resolve()
+            if not path.is_relative_to(expected_output_dir.resolve()) or path.name != output["filename"]:
+                raise ValueError("Invalid job file: output path is outside output directory")
+    return job
 
 
 def pick_ffmpeg() -> str:
@@ -148,6 +209,17 @@ def check_brightness(path: Path | str, sample_count: int = 5) -> Dict[str, Any]:
 # --- Subcommands ---
 
 def run_generate(
+    workflow_path: Path | str, server: str = "http://127.0.0.1:8188", output_dir: Path | str = "./output/generated",
+    manifest_path: Optional[Path | str] = None, client_id: Optional[str] = None, poll_interval: float = 1.0,
+    timeout: float = 120.0, job_file: Optional[Path | str] = None,
+) -> Dict[str, Any]:
+    out_dir = Path(output_dir).resolve()
+    job_path = (Path(job_file) if job_file else out_dir / "generation-job.json").resolve()
+    with job_lock(job_path):
+        return _run_generate_locked(workflow_path, server, out_dir, manifest_path, client_id, poll_interval, timeout, job_path)
+
+
+def _run_generate_locked(
     workflow_path: Path | str,
     server: str = "http://127.0.0.1:8188",
     output_dir: Path | str = "./output/generated",
@@ -155,6 +227,7 @@ def run_generate(
     client_id: Optional[str] = None,
     poll_interval: float = 1.0,
     timeout: float = 120.0,
+    job_file: Optional[Path | str] = None,
 ) -> Dict[str, Any]:
     """Execute ComfyUI API workflow JSON via /prompt -> /history -> /view.
     Zero auto-spend: checks failures, empty outputs, path traversal, and collisions.
@@ -168,17 +241,108 @@ def run_generate(
     with open(wf_path, "r", encoding="utf-8") as f:
         wf = json.load(f)
 
-    cid = client_id or f"videoctl-{int(time.time())}"
-    payload = {"prompt": wf.get("prompt", wf), "client_id": cid}
+    base = validate_server(server)
+    job_path = Path(job_file)
+    wf_hash = sha256_file(wf_path)
+    if job_path.exists():
+        try:
+            job = validate_job(json.loads(job_path.read_text(encoding="utf-8")), out_dir)
+        except (json.JSONDecodeError, OSError) as e:
+            raise ValueError(f"Invalid job file {job_path}: {e}") from e
+        if job.get("workflow_sha256") != wf_hash or job.get("server") != base:
+            raise RuntimeError("Existing job workflow SHA-256 or server does not match this request")
+        if job.get("status") == "completed" and _job_outputs_valid(job, out_dir):
+            _upsert_manifest(job, manifest_path)
+            return job
+        if job.get("status") == "manifest_pending" and _job_outputs_valid(job, out_dir):
+            _finish_manifest_pending(job, job_path, manifest_path)
+            return json.loads(job_path.read_text(encoding="utf-8"))
+        if not job.get("prompt_id"):
+            raise RuntimeError(f"Existing job has no prompt_id (status={job.get('status')}); refusing duplicate submission")
+        return _collect_generation(job, job_path, out_dir, manifest_path, poll_interval, timeout)
 
-    base = server.rstrip("/")
+    cid = client_id or f"videoctl-{int(time.time())}"
+    job = {"status": "submitting", "workflow": str(wf_path.resolve()), "workflow_sha256": wf_hash, "server": base, "client_id": cid, "output_dir": str(out_dir), "outputs": []}
+    write_json_atomic(job_path, job)
+    payload = {"prompt": wf.get("prompt", wf), "client_id": cid}
     req = urllib.request.Request(f"{base}/prompt", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req) as r:
-        resp = json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req) as r:
+            resp = json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        job["status"] = "submission_unknown"
+        job["error"] = str(e)
+        write_json_atomic(job_path, job)
+        raise RuntimeError(f"ComfyUI submission outcome unknown; refusing automatic retry: {e}") from e
 
     prompt_id = resp.get("prompt_id")
-    if not prompt_id:
-        raise RuntimeError(f"Server response missing prompt_id: {resp}")
+    if not isinstance(prompt_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", prompt_id):
+        job["status"] = "submission_unknown"
+        job["error"] = f"Server response missing prompt_id: {resp}"
+        write_json_atomic(job_path, job)
+        raise RuntimeError(job["error"])
+    job["prompt_id"] = prompt_id
+    job["status"] = "submitted"
+    write_json_atomic(job_path, job)
+    return _collect_generation(job, job_path, out_dir, manifest_path, poll_interval, timeout)
+
+
+def _job_outputs_valid(job: Dict[str, Any], output_dir: Path) -> bool:
+    outputs = job.get("outputs")
+    try:
+        return bool(outputs) and all(Path(o["path"]).resolve().is_relative_to(output_dir.resolve()) and Path(o["path"]).is_file() and Path(o["path"]).stat().st_size == o["size"] and sha256_file(o["path"]) == o["sha256"] for o in outputs)
+    except (KeyError, OSError, TypeError):
+        return False
+
+
+def resume_generate(job_file: Path | str, output_dir: Path | str = "./output/generated", manifest_path: Optional[Path | str] = None, poll_interval: float = 1.0, timeout: float = 120.0) -> Dict[str, Any]:
+    job_path, out_dir = Path(job_file).resolve(), Path(output_dir).resolve()
+    with job_lock(job_path):
+        return _resume_generate_locked(job_path, out_dir, manifest_path, poll_interval, timeout)
+
+
+def _resume_generate_locked(job_path: Path, out_dir: Path, manifest_path: Optional[Path | str], poll_interval: float, timeout: float) -> Dict[str, Any]:
+    try:
+        job = validate_job(json.loads(job_path.read_text(encoding="utf-8")), out_dir)
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Invalid job file {job_path}: {e}") from e
+    if job.get("status") == "completed" and _job_outputs_valid(job, out_dir):
+        _upsert_manifest(job, manifest_path)
+        return job
+    if job.get("status") == "manifest_pending" and _job_outputs_valid(job, out_dir):
+        _finish_manifest_pending(job, job_path, manifest_path)
+        return json.loads(job_path.read_text(encoding="utf-8"))
+    if not job.get("prompt_id"):
+        raise RuntimeError(f"Job has no prompt_id (status={job.get('status')}); cannot resume")
+    return _collect_generation(job, job_path, out_dir, manifest_path, poll_interval, timeout)
+
+
+def _upsert_manifest(record: Dict[str, Any], manifest_path: Optional[Path | str]) -> None:
+    if not manifest_path:
+        return
+    mp = Path(manifest_path)
+    data = json.loads(mp.read_text(encoding="utf-8")) if mp.is_file() else {}
+    generations = data.setdefault("generations", [])
+    for i, item in enumerate(generations):
+        if item.get("prompt_id") == record["prompt_id"]:
+            generations[i] = record
+            break
+    else:
+        generations.append(record)
+    write_json_atomic(mp, data)
+
+
+def _finish_manifest_pending(job: Dict[str, Any], job_path: Path, manifest_path: Optional[Path | str]) -> None:
+    completed = job.copy()
+    completed["status"] = "completed"
+    _upsert_manifest(completed, manifest_path)
+    write_json_atomic(job_path, completed)
+    job.update(completed)
+
+
+def _collect_generation(job: Dict[str, Any], job_path: Path, out_dir: Path, manifest_path: Optional[Path | str], poll_interval: float, timeout: float) -> Dict[str, Any]:
+    base, prompt_id = job["server"], job["prompt_id"]
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     start = time.time()
     hist = None
@@ -194,14 +358,22 @@ def run_generate(
         time.sleep(poll_interval)
 
     if not hist:
+        job["status"] = "timeout"
+        write_json_atomic(job_path, job)
         raise TimeoutError(f"Timed out after {timeout}s waiting for {prompt_id} on {base}")
 
     hist_status = hist.get("status", {})
     if hist_status.get("status_str") in ("error", "failed"):
+        job["status"] = "failed"
+        job["error"] = str(hist_status.get("messages", "status error"))
+        write_json_atomic(job_path, job)
         raise RuntimeError(f"ComfyUI prompt execution failed: {hist_status.get('messages', 'status error')}")
 
     outputs = hist.get("outputs", {})
     if not outputs:
+        job["status"] = "failed"
+        job["error"] = "empty outputs"
+        write_json_atomic(job_path, job)
         raise RuntimeError(f"ComfyUI prompt {prompt_id} finished with empty outputs; cannot record completed")
 
     downloaded = []
@@ -216,13 +388,21 @@ def run_generate(
                         url = f"{base}/view?{urllib.parse.urlencode({'filename': raw_fn, 'subfolder': sub, 'type': tp})}"
                         dest = out_dir / safe_fn
 
-                        if dest.exists():
-                            stem, ext = dest.stem, dest.suffix
-                            safe_fn = f"{stem}_{prompt_id[:8]}_{int(time.time())}{ext}"
+                        stem, ext = Path(safe_fn).stem, Path(safe_fn).suffix
+                        dest = out_dir / safe_fn
+                        collision = 0
+                        while dest.exists():
+                            collision += 1
+                            safe_fn = f"{stem}_{prompt_id[:8]}_{collision}{ext}"
                             dest = out_dir / safe_fn
-
-                        with urllib.request.urlopen(url) as vr, open(dest, "wb") as f_out:
-                            shutil.copyfileobj(vr, f_out)
+                        with urllib.request.urlopen(url) as vr:
+                            fd, tmp_name = tempfile.mkstemp(dir=out_dir, prefix=".download-")
+                            try:
+                                with os.fdopen(fd, "wb") as f_out:
+                                    shutil.copyfileobj(vr, f_out)
+                                os.link(tmp_name, dest)
+                            finally:
+                                os.unlink(tmp_name)
 
                         downloaded.append({
                             "node_id": nid, "category": cat, "filename": safe_fn,
@@ -230,29 +410,21 @@ def run_generate(
                         })
 
     if not downloaded:
+        job["status"] = "failed"
+        job["error"] = "no downloadable assets"
+        write_json_atomic(job_path, job)
         raise RuntimeError(f"ComfyUI outputs contained no downloadable assets for prompt_id {prompt_id}")
 
-    record = {
-        "status": "completed",
+    record = job.copy()
+    record.update({
+        "status": "manifest_pending",
         "prompt_id": prompt_id,
-        "workflow": str(wf_path.resolve()),
-        "workflow_sha256": sha256_file(wf_path),
-        "server": base,
         "outputs": downloaded,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-
-    if manifest_path:
-        mp = Path(manifest_path)
-        m_data = {}
-        if mp.is_file():
-            with open(mp, "r", encoding="utf-8") as f_in:
-                m_data = json.load(f_in)
-        m_data.setdefault("generations", []).append(record)
-        tmp_m = mp.with_suffix(".tmp")
-        with open(tmp_m, "w", encoding="utf-8") as f_out:
-            json.dump(m_data, f_out, indent=2, ensure_ascii=False)
-        tmp_m.replace(mp)
+    })
+    write_json_atomic(job_path, record)
+    _finish_manifest_pending(record, job_path, manifest_path)
+    record["status"] = "completed"
 
     return record
 
@@ -788,6 +960,14 @@ def main() -> int:
     p_gen.add_argument("--client-id")
     p_gen.add_argument("--poll-interval", type=float, default=1.0)
     p_gen.add_argument("--timeout", type=float, default=120.0)
+    p_gen.add_argument("--job-file")
+
+    p_resume = sub.add_parser("resume")
+    p_resume.add_argument("--job-file", required=True)
+    p_resume.add_argument("--output-dir", default="./output/generated")
+    p_resume.add_argument("--manifest")
+    p_resume.add_argument("--poll-interval", type=float, default=1.0)
+    p_resume.add_argument("--timeout", type=float, default=120.0)
 
     p_com = sub.add_parser("commerce")
     p_com.add_argument("--video-root", default=os.environ.get("VIDEO_ROOT"), help="tiktokshop/video root directory (or set VIDEO_ROOT env var)")
@@ -828,7 +1008,9 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.subcommand == "generate":
-            res = run_generate(args.workflow, args.server, args.output_dir, args.manifest, args.client_id, args.poll_interval, args.timeout)
+            res = run_generate(args.workflow, args.server, args.output_dir, args.manifest, args.client_id, args.poll_interval, args.timeout, args.job_file)
+        elif args.subcommand == "resume":
+            res = resume_generate(args.job_file, args.output_dir, args.manifest, args.poll_interval, args.timeout)
         elif args.subcommand == "commerce":
             res = run_commerce(args.video_root, args.config, args.stage, args.dry_run, args.bgm)
         elif args.subcommand == "drama":
