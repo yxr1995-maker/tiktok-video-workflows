@@ -51,3 +51,26 @@ python3 videoctl.py generate --workflow examples/comfyui_workflow_example.json -
 - **模板需替换与人工审核**：`examples/drama_manifest_example.json` 仅为配置结构模板，默认标为 `review_status: "pending"` 且功效/价格均为未核实占位。实际生产必须替换为真实素材、人工核验真实来源并置为 `review_status: "approved"`，否则 `preflight` 与 `drama` 均强行拒绝执行。
 - **价格与宣称（claims/price）人工核验**：未核实的功效承诺或价格标注（`claims_verified: false` 或 `price_verified: false`）严禁展示。若包含价格或功效宣称，必须明确人工核对来源（`price_source` / `claims_source`）及核对时间（`price_verified_at` / `claims_verified_at`），杜绝伪造。
 - **人工发布原则**：AI 素材只进素材池，最终发布挂车一律人工确认，不自动推流。
+
+## 5. generate/resume 崩溃恢复
+
+`videoctl generate` 写原子 job file（含 workflow SHA、server URL、prompt ID），支持幂等重入和中断恢复。render 流程当前要求导入的 manifest 包含媒体场景片段（`source_path`）；纯分镜创建的项目尚不支持自动渲染成片。
+
+```bash
+# 生成（指定 job file 路径）
+python3 scripts/videoctl.py generate \
+  --workflow examples/comfyui_workflow_example.json \
+  --output-dir ./output/generated \
+  --job-file ./output/generated/my-job.json
+
+# 中断后恢复
+python3 scripts/videoctl.py resume \
+  --job-file ./output/generated/my-job.json \
+  --output-dir ./output/generated
+```
+
+恢复边界：
+- 提交前先落盘并加锁：生成前完成 job 文件落盘并施加 flock，同 job 仅发起一次 POST
+- resume 绝不发起 POST：恢复阶段仅查询状态或复用既有产出，遇未知状态（服务端已受理但 prompt ID 未落盘）严格拒绝重新提交
+- 严格绑定与目录防护：校验 job schema、server URL、prompt ID 语法及 output-directory 绑定
+- 输出路径限制在 output directory 内，防止路径穿越
